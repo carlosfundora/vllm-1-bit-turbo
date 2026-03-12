@@ -261,7 +261,7 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is None and not vllm_is_batch_invariant():
+        if residual is None:
             return ir.ops.rms_norm(
                 x, self.weight, self.variance_epsilon, self.variance_size_override
             )
@@ -273,8 +273,7 @@ class RMSNorm(CustomOp):
         # This mirrors vLLM's fused_add_rms_norm semantics by mutating both
         # `x` (normalized output) and `residual` (residual-out buffer).
         if (
-            residual is not None
-            and getattr(self, "_use_oink_fused_add_rmsnorm", False)
+            getattr(self, "_use_oink_fused_add_rmsnorm", False)
             and x.is_cuda
             and residual.is_cuda
             and x.shape == residual.shape
@@ -310,20 +309,14 @@ class RMSNorm(CustomOp):
                     )
                     return x, residual
 
-        if residual is not None:
-            return fused_add_rms_norm(
-                x, residual, self.weight.data, self.variance_epsilon
-            )
-        else:
-            assert vllm_is_batch_invariant()
-            return rms_norm_batch_invariant(x, self.weight.data, self.variance_epsilon)
+        return fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
 
     def forward_hip(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is None and not vllm_is_batch_invariant():
+        if residual is None:
             return ir.ops.rms_norm(
                 x, self.weight, self.variance_epsilon, self.variance_size_override
             )
@@ -331,13 +324,9 @@ class RMSNorm(CustomOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
 
-        if residual is not None:
-            return self.rocm_norm_func_with_add(
-                x, residual, self.weight.data, self.variance_epsilon
-            )
-        else:
-            assert vllm_is_batch_invariant()
-            return rms_norm_batch_invariant(x, self.weight.data, self.variance_epsilon)
+        return self.rocm_norm_func_with_add(
+            x, residual, self.weight.data, self.variance_epsilon
+        )
 
     def forward_xpu(
         self,

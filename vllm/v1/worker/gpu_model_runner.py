@@ -2653,10 +2653,11 @@ class GPUModelRunner(
             err_str = str(e).lower()
             if 'hip' in err_str or 'acceleratorerror' in err_str or 'unspecified launch failure' in err_str:
                 logger.warning("HIP indexing failure detected; falling back to CPU for draft_token_ids indexing")
-                cpu_idx = (target_logits_indices + 1).to('cpu')
-                cpu_tokens = draft_token_ids.to('cpu')
-                result_cpu = cpu_tokens[cpu_idx]
-                draft_token_ids = result_cpu.to(draft_token_ids.device)
+                cpu_idx = (target_logits_indices + 1).to("cpu", non_blocking=True)
+                cpu_tokens = draft_token_ids.detach().to("cpu", non_blocking=True)
+                result_cpu = cpu_tokens.index_select(0, cpu_idx.flatten())
+                result_cpu = result_cpu.view(*cpu_idx.shape)
+                draft_token_ids = result_cpu.to(draft_token_ids.device, non_blocking=True)
             else:
                 raise
 

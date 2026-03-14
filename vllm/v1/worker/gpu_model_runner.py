@@ -2638,7 +2638,27 @@ class GPUModelRunner(
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
         draft_token_ids = self.input_ids.gpu[logits_indices]
-        draft_token_ids = draft_token_ids[target_logits_indices + 1]
+        
+        logger.info("draft_token_ids: device=%s, shape=%s, dtype=%s, contig=%s, strides=%s",
+                    draft_token_ids.device, tuple(draft_token_ids.shape), draft_token_ids.dtype,
+                    draft_token_ids.is_contiguous(), draft_token_ids.stride())
+        logger.info("target_logits_indices: device=%s, shape=%s, dtype=%s, contig=%s, strides=%s, min=%s, max=%s",
+                    target_logits_indices.device, tuple(target_logits_indices.shape), target_logits_indices.dtype,
+                    target_logits_indices.is_contiguous(), target_logits_indices.stride(),
+                    int(target_logits_indices.min().item()), int(target_logits_indices.max().item()))
+
+        try:
+            draft_token_ids = draft_token_ids[target_logits_indices + 1]
+        except Exception as e:
+            err_str = str(e).lower()
+            if 'hip' in err_str or 'acceleratorerror' in err_str or 'unspecified launch failure' in err_str:
+                logger.warning("HIP indexing failure detected; falling back to CPU for draft_token_ids indexing")
+                cpu_idx = (target_logits_indices + 1).to('cpu')
+                cpu_tokens = draft_token_ids.to('cpu')
+                result_cpu = cpu_tokens[cpu_idx]
+                draft_token_ids = result_cpu.to(draft_token_ids.device)
+            else:
+                raise
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,

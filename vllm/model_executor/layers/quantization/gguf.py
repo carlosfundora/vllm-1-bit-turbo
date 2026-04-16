@@ -558,8 +558,38 @@ class GGUFLinearMethod(LinearMethodBase):
         shard_id = layer.qweight.shard_id
 
         if shard_id:
-            # dequantize shard weights respectively
             shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+
+            # Fused merged-shard dispatch: when all shards share the same
+            # quant type and dim1, dispatch one fused call over the full
+            # padded weight instead of N separate kernel launches.
+            shard_types = [layer.qweight_type.shard_weight_type[idx]
+                           for idx in shard_id]
+            if len(set(shard_types)) == 1:
+                offsets = [layer.qweight.shard_offset_map[idx]
+                           for idx in shard_id]
+                dim1_sizes = [o[2] for o in offsets]
+                if len(set(dim1_sizes)) == 1:
+                    out = fused_mul_mat_gguf(
+                        x, layer.qweight, shard_types[0]
+                    )
+                    in_order = (
+                        offsets[0][0] == 0
+                        and all(
+                            offsets[i][0] == offsets[i - 1][1]
+                            for i in range(1, len(offsets))
+                        )
+                    )
+                    if not in_order:
+                        slices = []
+                        for start, end, _ in offsets:
+                            slices.append(out[:, start:end])
+                        out = torch.cat(slices, dim=1)
+                    if bias is not None:
+                        out.add_(bias)
+                    return out
+
+            # Fallback: different quant types or padded dims across shards
             qweight = layer.qweight
             result = []
             for idx in shard_id:

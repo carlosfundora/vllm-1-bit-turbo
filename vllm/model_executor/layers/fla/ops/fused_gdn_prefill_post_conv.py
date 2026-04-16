@@ -65,20 +65,23 @@ def _fused_post_conv_kernel(
 
     offs_t = i_tb * BLOCK_T + tl.arange(0, BLOCK_T)  # [BLOCK_T]
     mask_t = offs_t < L
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    offs_t_safe = tl.where(mask_t, offs_t, 0)
 
     if i_head < H:
         # ============ Q/K head processing ============
         i_h = i_head
         offs_k = tl.arange(0, BK)  # [BK]
         mask_k = offs_k < K
+        offs_k_safe = tl.where(mask_k, offs_k, 0)
         mask_2d = mask_t[:, None] & mask_k[None, :]  # [BLOCK_T, BK]
 
         # Load Q features: mixed_qkv[t, i_h*K + k]
-        q_offsets = offs_t[:, None] * stride_x_tok + i_h * K + offs_k[None, :]
+        q_offsets = offs_t_safe[:, None] * stride_x_tok + i_h * K + offs_k_safe[None, :]
         q_f32 = tl.load(mixed_qkv_ptr + q_offsets, mask=mask_2d, other=0).to(tl.float32)
 
         # Load K features: mixed_qkv[t, HK + i_h*K + k]
-        k_offsets = offs_t[:, None] * stride_x_tok + HK + i_h * K + offs_k[None, :]
+        k_offsets = offs_t_safe[:, None] * stride_x_tok + HK + i_h * K + offs_k_safe[None, :]
         k_f32 = tl.load(mixed_qkv_ptr + k_offsets, mask=mask_2d, other=0).to(tl.float32)
 
         if APPLY_L2NORM:
@@ -91,7 +94,7 @@ def _fused_post_conv_kernel(
             k_f32 = k_f32 * k_inv[:, None]
 
         # Store Q
-        q_out = offs_t[:, None] * stride_q_tok + i_h * K + offs_k[None, :]
+        q_out = offs_t_safe[:, None] * stride_q_tok + i_h * K + offs_k_safe[None, :]
         tl.store(
             q_ptr + q_out,
             q_f32.to(q_ptr.dtype.element_ty),
@@ -99,7 +102,7 @@ def _fused_post_conv_kernel(
         )
 
         # Store K
-        k_out = offs_t[:, None] * stride_k_tok + i_h * K + offs_k[None, :]
+        k_out = offs_t_safe[:, None] * stride_k_tok + i_h * K + offs_k_safe[None, :]
         tl.store(
             k_ptr + k_out,
             k_f32.to(k_ptr.dtype.element_ty),
@@ -110,26 +113,27 @@ def _fused_post_conv_kernel(
         i_hv = i_head - H
         offs_v = tl.arange(0, BV)  # [BV]
         mask_v = offs_v < V
+        offs_v_safe = tl.where(mask_v, offs_v, 0)
         mask_2d = mask_t[:, None] & mask_v[None, :]  # [BLOCK_T, BV]
 
         V_OFFSET: tl.constexpr = 2 * H * K
 
         # Load V features: mixed_qkv[t, 2*H*K + i_hv*V + v]
         v_offsets = (
-            offs_t[:, None] * stride_x_tok + V_OFFSET + i_hv * V + offs_v[None, :]
+            offs_t_safe[:, None] * stride_x_tok + V_OFFSET + i_hv * V + offs_v_safe[None, :]
         )
         v_vals = tl.load(mixed_qkv_ptr + v_offsets, mask=mask_2d, other=0)
 
         # Store V
-        v_out = offs_t[:, None] * stride_v_tok + i_hv * V + offs_v[None, :]
+        v_out = offs_t_safe[:, None] * stride_v_tok + i_hv * V + offs_v_safe[None, :]
         tl.store(v_ptr + v_out, v_vals, mask=mask_2d)
 
         # Gating: one scalar per (token, v-head)
         A_log_val = tl.load(A_log_ptr + i_hv).to(tl.float32)
         dt_bias_val = tl.load(dt_bias_ptr + i_hv).to(tl.float32)
 
-        a_offsets = offs_t * stride_a_tok + i_hv
-        b_offsets = offs_t * stride_b_tok + i_hv
+        a_offsets = offs_t_safe * stride_a_tok + i_hv
+        b_offsets = offs_t_safe * stride_b_tok + i_hv
         a_vals = tl.load(a_ptr + a_offsets, mask=mask_t, other=0).to(tl.float32)
         b_vals = tl.load(b_ptr + b_offsets, mask=mask_t, other=0).to(tl.float32)
 
@@ -144,7 +148,7 @@ def _fused_post_conv_kernel(
 
         beta_vals = tl.sigmoid(b_vals)
 
-        gb_offsets = offs_t * HV + i_hv
+        gb_offsets = offs_t_safe * HV + i_hv
         tl.store(g_ptr + gb_offsets, g_vals, mask=mask_t)
         tl.store(beta_ptr + gb_offsets, beta_vals, mask=mask_t)
 

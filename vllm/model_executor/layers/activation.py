@@ -39,9 +39,11 @@ def _swiglustep_and_mul_kernel(
     x_row_ptr = x_ptr + x_stride * i
     offsets = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < d
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    offsets_safe = tl.where(mask, offsets, 0)
 
-    gate = tl.load(x_row_ptr + offsets, mask=mask).to(tl.float32)
-    up = tl.load(x_row_ptr + offsets + d, mask=mask).to(tl.float32)
+    gate = tl.load(x_row_ptr + offsets_safe, mask=mask).to(tl.float32)
+    up = tl.load(x_row_ptr + offsets_safe + d, mask=mask).to(tl.float32)
 
     gate_silu = tl.sigmoid(gate) * gate
     gate_clamped = tl.minimum(gate_silu, limit)
@@ -49,7 +51,7 @@ def _swiglustep_and_mul_kernel(
 
     result = gate_clamped * up_clamped
     result = result.to(x_ptr.dtype.element_ty)
-    tl.store(o_row_ptr + offsets, result, mask=mask)
+    tl.store(o_row_ptr + offsets_safe, result, mask=mask)
 
 
 def swiglustep_and_mul_triton(

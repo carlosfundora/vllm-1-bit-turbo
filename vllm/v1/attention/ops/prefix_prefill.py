@@ -120,13 +120,14 @@ def _fwd_kernel(
     offs_n = tl.arange(0, BLOCK_N)
     # [D]; starts at 0
     offs_d = tl.arange(0, BLOCK_DMODEL_PADDED)
+    offs_d_safe = tl.where(offs_d < BLOCK_DMODEL, offs_d, 0)  # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
     # [M]; starts at current position in query
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     # [M,D]
     off_q = (
         (cur_batch_in_all_start_index + offs_m[:, None]) * stride_qbs
         + cur_head * stride_qh
-        + offs_d[None, :] * stride_qd
+        + offs_d_safe[None, :] * stride_qd
     )
 
     dim_mask = tl.where(tl.arange(0, BLOCK_DMODEL_PADDED) < BLOCK_DMODEL, 1, 0).to(
@@ -162,7 +163,8 @@ def _fwd_kernel(
         # Calculate the logical block index of each of the 32 tokens
         # in the current Tile (handling cross-block cases).
         token_indices = start_n + offs_bs_n
-        bn_logical_indices = token_indices // PHYSICAL_BLOCK_SIZE
+        token_indices_safe = tl.where(token_indices < cur_batch_ctx_len, token_indices, 0)
+        bn_logical_indices = token_indices_safe // PHYSICAL_BLOCK_SIZE
 
         # 2. Vectorized loading of physical block IDs from B_Loc
         bn = tl.load(
@@ -171,22 +173,22 @@ def _fwd_kernel(
 
         # 3. Calculate the exact offset of
         # each token within its physical block.
-        internal_offsets = token_indices % PHYSICAL_BLOCK_SIZE
+        internal_offsets = token_indices_safe % PHYSICAL_BLOCK_SIZE
 
         # Addressing of K (5D)
         off_k = (
             bn[None, :] * stride_k_cache_bs
             + cur_kv_head * stride_k_cache_h
-            + (offs_d[:, None] // x) * stride_k_cache_d
+            + (offs_d_safe[:, None] // x) * stride_k_cache_d
             + internal_offsets[None, :] * stride_k_cache_bl
-            + (offs_d[:, None] % x) * stride_k_cache_x
+            + (offs_d_safe[:, None] % x) * stride_k_cache_x
         )
 
         # Addressing of V (4D)
         off_v = (
             bn[:, None] * stride_v_cache_bs
             + cur_kv_head * stride_v_cache_h
-            + offs_d[None, :] * stride_v_cache_d
+            + offs_d_safe[None, :] * stride_v_cache_d
             + internal_offsets[:, None] * stride_v_cache_bl
         )
 
@@ -270,12 +272,12 @@ def _fwd_kernel(
     off_k = (
         offs_n[None, :] * stride_kbs
         + cur_kv_head * stride_kh
-        + offs_d[:, None] * stride_kd
+        + offs_d_safe[:, None] * stride_kd
     )
     off_v = (
         offs_n[:, None] * stride_vbs
         + cur_kv_head * stride_vh
-        + offs_d[None, :] * stride_vd
+        + offs_d_safe[None, :] * stride_vd
     )
     k_ptrs = K + off_k
     v_ptrs = V + off_v
@@ -341,7 +343,7 @@ def _fwd_kernel(
     off_o = (
         (cur_batch_in_all_start_index + offs_m[:, None]) * stride_obs
         + cur_head * stride_oh
-        + offs_d[None, :] * stride_od
+        + offs_d_safe[None, :] * stride_od
     )
     out_ptrs = Out + off_o
     if USE_FP8:
@@ -425,11 +427,12 @@ def _fwd_kernel_alibi(
     # initialize offsets
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL_PADDED)
+    offs_d_safe = tl.where(offs_d < BLOCK_DMODEL, offs_d, 0)  # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     off_q = (
         (cur_batch_in_all_start_index + offs_m[:, None]) * stride_qbs
         + cur_head * stride_qh
-        + offs_d[None, :] * stride_qd
+        + offs_d_safe[None, :] * stride_qd
     )
 
     dim_mask = tl.where(tl.arange(0, BLOCK_DMODEL_PADDED) < BLOCK_DMODEL, 1, 0).to(
@@ -454,25 +457,27 @@ def _fwd_kernel_alibi(
     for start_n in range(0, cur_batch_ctx_len, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
+        offs_bn = start_n + offs_n
+        offs_bn_safe = tl.where(offs_bn < cur_batch_ctx_len, offs_bn, 0)
         bn = tl.load(
             B_Loc
             + cur_batch * stride_b_loc_b
-            + ((start_n + offs_n) // block_size) * stride_b_loc_s,
-            mask=(start_n + offs_n) < cur_batch_ctx_len,
+            + (offs_bn_safe // block_size) * stride_b_loc_s,
+            mask=offs_bn < cur_batch_ctx_len,
             other=0,
         ).to(tl.int64)
         off_k = (
             bn[None, :] * stride_k_cache_bs
             + cur_kv_head * stride_k_cache_h
-            + (offs_d[:, None] // x) * stride_k_cache_d
-            + ((start_n + offs_n[None, :]) % block_size) * stride_k_cache_bl
-            + (offs_d[:, None] % x) * stride_k_cache_x
+            + (offs_d_safe[:, None] // x) * stride_k_cache_d
+            + (offs_bn_safe[None, :] % block_size) * stride_k_cache_bl
+            + (offs_d_safe[:, None] % x) * stride_k_cache_x
         )
         off_v = (
             bn[:, None] * stride_v_cache_bs
             + cur_kv_head * stride_v_cache_h
-            + offs_d[None, :] * stride_v_cache_d
-            + (start_n + offs_n[:, None]) % block_size * stride_v_cache_bl
+            + offs_d_safe[None, :] * stride_v_cache_d
+            + offs_bn_safe[:, None] % block_size * stride_v_cache_bl
         )
         k_load = tl.load(
             K_cache + off_k,
@@ -539,12 +544,12 @@ def _fwd_kernel_alibi(
     off_k = (
         offs_n[None, :] * stride_kbs
         + cur_kv_head * stride_kh
-        + offs_d[:, None] * stride_kd
+        + offs_d_safe[:, None] * stride_kd
     )
     off_v = (
         offs_n[:, None] * stride_vbs
         + cur_kv_head * stride_vh
-        + offs_d[None, :] * stride_vd
+        + offs_d_safe[None, :] * stride_vd
     )
     k_ptrs = K + off_k
     v_ptrs = V + off_v
@@ -621,7 +626,7 @@ def _fwd_kernel_alibi(
     off_o = (
         (cur_batch_in_all_start_index + offs_m[:, None]) * stride_obs
         + cur_head * stride_oh
-        + offs_d[None, :] * stride_od
+        + offs_d_safe[None, :] * stride_od
     )
     out_ptrs = Out + off_o
     tl.store(

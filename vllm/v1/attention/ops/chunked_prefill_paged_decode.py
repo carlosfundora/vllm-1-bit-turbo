@@ -95,11 +95,13 @@ def kernel_paged_attention_2d(
     head_mask = query_head_idx < (kv_head_idx + 1) * num_queries_per_kv
     head_mask = head_mask & (query_head_idx < num_query_heads)
 
-    dim_mask = tl.where(tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE, 1, 0).to(tl.int1)
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    offs_d_safe = tl.where(offs_d < HEAD_SIZE, offs_d, 0)  # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
 
     # Q : (num_queries_per_kv, HEAD_SIZE,)
     Q = tl.load(
-        query_ptr + query_offset + tl.arange(0, HEAD_SIZE_PADDED)[None, :],
+        query_ptr + query_offset + offs_d_safe[None, :],
         mask=dim_mask[None, :] & head_mask[:, None],
         other=0.0,
     )
@@ -131,7 +133,6 @@ def kernel_paged_attention_2d(
     num_blocks = cdiv_fn(seq_len, BLOCK_SIZE)
 
     offs_n = tl.arange(0, BLOCK_SIZE)
-    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     # iterate through tiles
     for j in range(0, num_blocks):
         start_n = j * BLOCK_SIZE
@@ -140,25 +141,27 @@ def kernel_paged_attention_2d(
         # Supports non-contiguous mapping
         # from logical blocks to physical blocks
         abs_token_idx = start_n + offs_n
-        l_block_idx = abs_token_idx // PHYSICAL_BLOCK_SIZE
+        token_mask = abs_token_idx < seq_len
+        abs_token_idx_safe = tl.where(token_mask, abs_token_idx, 0)
+        l_block_idx = abs_token_idx_safe // PHYSICAL_BLOCK_SIZE
         # Vectorized loading of physical block IDs
         p_block_idx = tl.load(block_tables_ptr + block_table_offset + l_block_idx)
-        internal_offsets = abs_token_idx % PHYSICAL_BLOCK_SIZE
+        internal_offsets = abs_token_idx_safe % PHYSICAL_BLOCK_SIZE
 
         # 5D addressing logic of K
         k_offset = (
             p_block_idx[None, :] * stride_k_cache_0
             + kv_head_idx * stride_k_cache_1
-            + (offs_d[:, None] // x) * stride_k_cache_2
+            + (offs_d_safe[:, None] // x) * stride_k_cache_2
             + internal_offsets[None, :] * stride_k_cache_3
-            + (offs_d[:, None] % x) * stride_k_cache_4
+            + (offs_d_safe[:, None] % x) * stride_k_cache_4
         )
 
         # 4D addressing logic of V (Slot is innermost)
         v_offset = (
             p_block_idx[:, None] * stride_v_cache_0
             + kv_head_idx * stride_v_cache_1
-            + offs_d[None, :] * stride_v_cache_2
+            + offs_d_safe[None, :] * stride_v_cache_2
             + internal_offsets[:, None] * stride_v_cache_3
         )
 
@@ -241,7 +244,7 @@ def kernel_paged_attention_2d(
     )
 
     tl.store(
-        output_ptr + output_offset[:, None] + tl.arange(0, HEAD_SIZE_PADDED)[None, :],
+        output_ptr + output_offset[:, None] + offs_d_safe[None, :],
         acc,
         mask=dim_mask[None, :] & head_mask[:, None],
     )

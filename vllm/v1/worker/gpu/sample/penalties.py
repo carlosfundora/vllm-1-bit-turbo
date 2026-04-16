@@ -141,11 +141,12 @@ def _penalties_kernel(
     block_idx = tl.program_id(1)
     block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = block < vocab_size
-    logits = tl.load(logits_ptr + token_idx * logits_stride + block, mask=mask)
+    block_safe = tl.where(mask, block, 0)  # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    logits = tl.load(logits_ptr + token_idx * logits_stride + block_safe, mask=mask)
     logits = logits.to(tl.float32)
 
     base_output_counts = tl.load(
-        output_bin_counts_ptr + req_state_idx * output_bin_counts_stride + block,
+        output_bin_counts_ptr + req_state_idx * output_bin_counts_stride + block_safe,
         mask=mask,
         other=0,
     )
@@ -167,9 +168,11 @@ def _penalties_kernel(
     # Apply repetition penalties.
     if use_rep_penalty:
         packed_block = block_idx * BLOCK_SIZE // 32 + tl.arange(0, BLOCK_SIZE // 32)
+        packed_block_mask = packed_block < tl.cdiv(vocab_size, 32)
+        packed_block_safe = tl.where(packed_block_mask, packed_block, 0)
         packed_mask = tl.load(
-            prompt_bin_mask_ptr + req_state_idx * prompt_bin_mask_stride + packed_block,
-            mask=packed_block < tl.cdiv(vocab_size, 32),
+            prompt_bin_mask_ptr + req_state_idx * prompt_bin_mask_stride + packed_block_safe,
+            mask=packed_block_mask,
             other=0,
         )
         prompt_bin_mask = (packed_mask[:, None] >> (tl.arange(0, 32)[None, :])) & 1
@@ -186,7 +189,7 @@ def _penalties_kernel(
     # Apply presence penalties.
     logits -= pres_penalty * output_bin_mask
     # Store back to logits.
-    tl.store(logits_ptr + token_idx * logits_stride + block, logits, mask=mask)
+    tl.store(logits_ptr + token_idx * logits_stride + block_safe, logits, mask=mask)
 
 
 def apply_penalties(
@@ -248,14 +251,16 @@ def _bincount_kernel(
     block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     if block_idx * BLOCK_SIZE < prompt_len:
         mask = block < prompt_len
+        block_safe = tl.where(mask, block, 0)  # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
         prompt_tokens = tl.load(
-            all_token_ids_ptr + req_state_idx * all_token_ids_stride + block, mask=mask
+            all_token_ids_ptr + req_state_idx * all_token_ids_stride + block_safe, mask=mask
         )
         idx = prompt_tokens // 32
+        idx_safe = tl.where(mask, idx, 0)
         bit_idx = prompt_tokens % 32
         bit = tl.full((BLOCK_SIZE,), 1, tl.int32) << bit_idx
         tl.atomic_or(
-            prompt_bin_mask_ptr + req_state_idx * prompt_bin_mask_stride + idx,
+            prompt_bin_mask_ptr + req_state_idx * prompt_bin_mask_stride + idx_safe,
             bit,
             mask=mask,
         )
@@ -263,13 +268,15 @@ def _bincount_kernel(
     if (block_idx + 1) * BLOCK_SIZE >= prompt_len:
         mask = block < prefill_len
         mask &= block >= prompt_len
+        block_safe = tl.where(mask, block, 0)
         output_tokens = tl.load(
-            all_token_ids_ptr + req_state_idx * all_token_ids_stride + block, mask=mask
+            all_token_ids_ptr + req_state_idx * all_token_ids_stride + block_safe, mask=mask
         )
+        output_tokens_safe = tl.where(mask, output_tokens, 0)
         tl.atomic_add(
             output_bin_counts_ptr
             + req_state_idx * output_bin_counts_stride
-            + output_tokens,
+            + output_tokens_safe,
             1,
             mask=mask,
         )

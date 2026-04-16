@@ -212,9 +212,11 @@ def eagle_prepare_next_token_padded_kernel(
         # Count the number of valid tokens among the sampled tokens.
         token_offs = tl.arange(0, BLOCK_SIZE_TOKENS)
         token_mask = token_offs < num_sampled_tokens_per_req
+        # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+        token_offs_safe = tl.where(token_mask, token_offs, 0)
 
         row_ptr = sampled_token_ids_ptr + req_idx * stride_sampled_token_ids
-        token_ids = tl.load(row_ptr + token_offs, mask=token_mask, other=-1)
+        token_ids = tl.load(row_ptr + token_offs_safe, mask=token_mask, other=-1)
 
         # Rejected tokens are -1, valid tokens are in [0, vocab_size)
         is_valid_mask = (token_ids != -1) & (token_ids < vocab_size) & token_mask
@@ -383,11 +385,14 @@ def copy_and_expand_eagle_inputs_kernel(
     )
     is_rejected_region = j >= num_valid_tokens + num_padding_slots_per_request
 
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    j_safe = tl.where(in_bounds, j, 0)
+
     # Compute output indices
-    out_idx = output_start + j
+    out_idx = output_start + j_safe
 
     # For valid tokens, compute input index
-    in_idx = query_start_loc + input_offset + j
+    in_idx = query_start_loc + input_offset + j_safe
     # Clamp to avoid out-of-bounds access (masked loads still need valid addresses)
     in_idx_clamped = tl.minimum(in_idx, total_input_tokens - 1)
 
@@ -430,8 +435,11 @@ def copy_and_expand_eagle_inputs_kernel(
     new_token_local_idx = (
         j - num_valid_tokens
     )  # 0 for bonus, 1, 2, ... for parallel drafting
+    new_token_local_idx_safe = tl.where(
+        is_new_token_region & in_bounds, new_token_local_idx, 0
+    )
     new_token_out_idx = (
-        request_idx * num_padding_slots_per_request + new_token_local_idx
+        request_idx * num_padding_slots_per_request + new_token_local_idx_safe
     )
 
     # Compute hidden state mapping (source index -> destination index)
@@ -440,7 +448,7 @@ def copy_and_expand_eagle_inputs_kernel(
     if shift_input_ids:
         num_input_tokens_this_request = next_query_start_loc - query_start_loc
         is_input_region = j < num_input_tokens_this_request
-        src_idx = query_start_loc + j
+        src_idx = query_start_loc + tl.where(is_input_region, j_safe, 0)
         tl.store(out_hidden_state_mapping_ptr + src_idx, out_idx, mask=is_input_region)
 
     # Store outputs
@@ -510,9 +518,13 @@ def copy_and_expand_dflash_inputs_kernel(
     is_query = (~is_ctx) & in_bounds
     query_off = j - num_ctx  # offset within query portion (0-indexed)
 
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    j_safe = tl.where(in_bounds, j, 0)
+    query_off_safe = tl.where(is_query, query_off, 0)
+
     # --- Positions ---
     # Context: load from target_positions
-    ctx_pos_idx = tl.minimum(ctx_start + j, total_input_tokens - 1)
+    ctx_pos_idx = tl.minimum(ctx_start + j_safe, total_input_tokens - 1)
     ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_ctx, other=0)
 
     # Query: last_valid_pos + 1 + query_off
@@ -529,9 +541,9 @@ def copy_and_expand_dflash_inputs_kernel(
     positions = tl.where(is_ctx, ctx_pos, query_pos)
 
     # Context and query positions go to separate buffers.
-    ctx_pos_out = ctx_start + j
+    ctx_pos_out = ctx_start + j_safe
     tl.store(out_context_positions_ptr + ctx_pos_out, ctx_pos, mask=is_ctx)
-    query_out = req_idx * num_query_per_req + query_off
+    query_out = req_idx * num_query_per_req + query_off_safe
     tl.store(out_query_positions_ptr + query_out, query_pos, mask=is_query)
 
     # --- Slot mapping (block_table lookup for all positions) ---
@@ -555,7 +567,8 @@ def copy_and_expand_dflash_inputs_kernel(
 
     # --- Token indices to sample (mask tokens, skip the bonus token) ---
     is_sample = is_query & (query_off > 0)
-    sample_out_idx = req_idx * num_speculative_tokens + (query_off - 1)
+    sample_off_safe = tl.where(is_sample, query_off_safe - 1, 0)
+    sample_out_idx = req_idx * num_speculative_tokens + sample_off_safe
     tl.store(
         out_token_indices_ptr + sample_out_idx,
         query_out,

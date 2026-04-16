@@ -53,13 +53,16 @@ def reshape_and_cache_kernel_flash(
     tile_i = tl.program_id(axis=1)
     tile_offs = tl.arange(0, TILE_SIZE)
     tile_pos = tile_i * TILE_SIZE + tile_offs
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    tile_mask = tile_pos < (num_heads * head_size)
+    tile_pos_safe = tl.where(tile_mask, tile_pos, 0)
     src_key_idx = token_idx * key_stride
     src_value_idx = token_idx * value_stride
 
     if USE_HEAD_MAJOR_LAYOUT:
         # Decompose the tile index back into head and dim coordinates.
-        cur_head = tile_pos // head_size
-        cur_dim = tile_pos % head_size
+        cur_head = tile_pos_safe // head_size
+        cur_dim = tile_pos_safe % head_size
         # Value addressing (4D): [Block, Head, Dim, Slot]
         tgt_idx_v = (
             block_idx * block_stride
@@ -76,8 +79,8 @@ def reshape_and_cache_kernel_flash(
             + (cur_dim % x)
         )
     else:
-        cur_head = tile_pos // head_size
-        cur_dim = tile_pos % head_size
+        cur_head = tile_pos_safe // head_size
+        cur_dim = tile_pos_safe % head_size
         tgt_idx_k = (
             block_idx * block_stride
             + block_offset * page_stride
@@ -88,7 +91,7 @@ def reshape_and_cache_kernel_flash(
 
     # [TILE_SIZE]
     key_load = tl.load(
-        key_ptr + src_key_idx + tile_pos, mask=tile_pos < (num_heads * head_size)
+        key_ptr + src_key_idx + tile_pos_safe, mask=tile_mask
     )
     if FP8_KV_CACHE:
         # tl.store will do the correct implicit cast to fp8,
@@ -99,7 +102,7 @@ def reshape_and_cache_kernel_flash(
 
     # [TILE_SIZE]
     value_load = tl.load(
-        value_ptr + src_value_idx + tile_pos, mask=tile_pos < (num_heads * head_size)
+        value_ptr + src_value_idx + tile_pos_safe, mask=tile_mask
     )
     if FP8_KV_CACHE:
         if value_load.dtype.is_fp8():
@@ -114,12 +117,12 @@ def reshape_and_cache_kernel_flash(
     tl.store(
         key_cache_ptr + tgt_idx_k,
         key_tile,
-        mask=tile_pos < (num_heads * head_size),
+        mask=tile_mask,
     )
     tl.store(
         value_cache_ptr + tgt_idx_v,
         value_tile,
-        mask=tile_pos < (num_heads * head_size),
+        mask=tile_mask,
     )
     return
 
@@ -181,8 +184,10 @@ def _reshape_cache_per_token_head(
 
     # ---- Key: load one head → absmax → quantize → store -------------------
     k_mask = dim_offs < head_size
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    dim_offs_k = tl.where(k_mask, dim_offs, 0)
     k_h = tl.load(
-        key_ptr + tok * stride_key_tok + head * stride_key_head + dim_offs,
+        key_ptr + tok * stride_key_tok + head * stride_key_head + dim_offs_k,
         mask=k_mask,
         other=0.0,
     ).to(tl.float32)
@@ -202,15 +207,17 @@ def _reshape_cache_per_token_head(
         + blk * stride_kc_blk
         + slot_in_blk * stride_kc_slot
         + head * stride_kc_head
-        + dim_offs,
+        + dim_offs_k,
         k_q,
         mask=k_mask,
     )
 
     # ---- Value: same per-head approach ------------------------------------
     v_mask = dim_offs < head_size_v
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    dim_offs_v = tl.where(v_mask, dim_offs, 0)
     v_h = tl.load(
-        value_ptr + tok * stride_val_tok + head * stride_val_head + dim_offs,
+        value_ptr + tok * stride_val_tok + head * stride_val_head + dim_offs_v,
         mask=v_mask,
         other=0.0,
     ).to(tl.float32)
@@ -230,7 +237,7 @@ def _reshape_cache_per_token_head(
         + blk * stride_vc_blk
         + slot_in_blk * stride_vc_slot
         + head * stride_vc_head
-        + dim_offs,
+        + dim_offs_v,
         v_q,
         mask=v_mask,
     )
@@ -461,6 +468,10 @@ def reshape_and_cache_kernel_flash_diffkv(
     tile_i = tl.program_id(axis=1)
     tile_offs = tl.arange(0, TILE_SIZE)
 
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    tile_offs_k = tl.where(tile_offs < head_size_k, tile_offs, 0)
+    tile_offs_v = tl.where(tile_offs < head_size_v, tile_offs, 0)
+
     block_idx = slot_idx // block_size
     block_offset = slot_idx % block_size
 
@@ -474,7 +485,7 @@ def reshape_and_cache_kernel_flash_diffkv(
     )
 
     # [TILE_SIZE]
-    key_load = tl.load(key_ptr + src_key_idx + tile_offs, mask=tile_offs < head_size_k)
+    key_load = tl.load(key_ptr + src_key_idx + tile_offs_k, mask=tile_offs < head_size_k)
     if FP8_KV_CACHE:
         # tl.store will do the correct implicit cast to fp8,
         # based on the key_cache_ptr.dtype.element_ty
@@ -484,7 +495,7 @@ def reshape_and_cache_kernel_flash_diffkv(
 
     # [TILE_SIZE]
     value_load = tl.load(
-        value_ptr + src_value_idx + tile_offs, mask=tile_offs < head_size_v
+        value_ptr + src_value_idx + tile_offs_v, mask=tile_offs < head_size_v
     )
     if FP8_KV_CACHE:
         if value_load.dtype.is_fp8():
@@ -497,12 +508,12 @@ def reshape_and_cache_kernel_flash_diffkv(
         value_tile = value_load
 
     tl.store(
-        kv_cache_ptr + tgt_idx + tile_offs,
+        kv_cache_ptr + tgt_idx + tile_offs_k,
         key_tile,
         mask=tile_offs < head_size_k,
     )
     tl.store(
-        kv_cache_ptr + tgt_idx + head_size_k + tile_offs,
+        kv_cache_ptr + tgt_idx + head_size_k + tile_offs_v,
         value_tile,
         mask=tile_offs < head_size_v,
     )

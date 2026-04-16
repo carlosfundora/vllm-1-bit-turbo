@@ -179,28 +179,32 @@ def _bias_kernel(
     if num_allowed_token_ids > 0:
         block = tl.arange(0, BLOCK_SIZE)
         mask = block < num_allowed_token_ids
+        block_safe = tl.where(mask, block, 0)  # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
 
         # Save logits for allowed token IDs.
         allowed_token_ids = tl.load(
-            allowed_token_ids_ptr + req_state_idx * allowed_token_ids_stride + block,
+            allowed_token_ids_ptr + req_state_idx * allowed_token_ids_stride + block_safe,
             mask=mask,
         )
+        allowed_token_ids_safe = tl.where(mask, allowed_token_ids, 0)
         logits = tl.load(
-            logits_ptr + token_idx * logits_stride + allowed_token_ids, mask=mask
+            logits_ptr + token_idx * logits_stride + allowed_token_ids_safe, mask=mask
         )
 
         # Set logits to -inf for all tokens.
         for i in range(0, vocab_size, LOGITS_BLOCK_SIZE):
             offset = i + tl.arange(0, LOGITS_BLOCK_SIZE)
+            offset_mask = offset < vocab_size
+            offset_safe = tl.where(offset_mask, offset, 0)
             tl.store(
-                logits_ptr + token_idx * logits_stride + offset,
+                logits_ptr + token_idx * logits_stride + offset_safe,
                 -float("inf"),
-                mask=offset < vocab_size,
+                mask=offset_mask,
             )
 
         # Restore logits for allowed token IDs.
         tl.store(
-            logits_ptr + token_idx * logits_stride + allowed_token_ids,
+            logits_ptr + token_idx * logits_stride + allowed_token_ids_safe,
             logits,
             mask=mask,
         )
@@ -209,14 +213,16 @@ def _bias_kernel(
     num_logit_bias = tl.load(num_logit_bias_ptr + req_state_idx)
     if num_logit_bias > 0:
         mask = block < num_logit_bias
+        block_safe = tl.where(mask, block, 0)
         token_ids = tl.load(
-            bias_token_ids_ptr + req_state_idx * bias_token_ids_stride + block,
+            bias_token_ids_ptr + req_state_idx * bias_token_ids_stride + block_safe,
             mask=mask,
         )
-        bias = tl.load(bias_ptr + req_state_idx * bias_stride + block, mask=mask)
-        logits = tl.load(logits_ptr + token_idx * logits_stride + token_ids, mask=mask)
+        bias = tl.load(bias_ptr + req_state_idx * bias_stride + block_safe, mask=mask)
+        token_ids_safe = tl.where(mask, token_ids, 0)
+        logits = tl.load(logits_ptr + token_idx * logits_stride + token_ids_safe, mask=mask)
         logits += bias
-        tl.store(logits_ptr + token_idx * logits_stride + token_ids, logits, mask=mask)
+        tl.store(logits_ptr + token_idx * logits_stride + token_ids_safe, logits, mask=mask)
 
     # Apply min tokens.
     num_stop_token_ids = tl.load(num_stop_token_ids_ptr + req_state_idx)
@@ -224,12 +230,14 @@ def _bias_kernel(
     min_len = tl.load(min_lens_ptr + req_state_idx)
     if num_stop_token_ids > 0 and pos < min_len:
         mask = block < num_stop_token_ids
+        block_safe = tl.where(mask, block, 0)
         stop_token_ids = tl.load(
-            stop_token_ids_ptr + req_state_idx * stop_token_ids_stride + block,
+            stop_token_ids_ptr + req_state_idx * stop_token_ids_stride + block_safe,
             mask=mask,
         )
+        stop_token_ids_safe = tl.where(mask, stop_token_ids, 0)
         tl.store(
-            logits_ptr + token_idx * logits_stride + stop_token_ids,
+            logits_ptr + token_idx * logits_stride + stop_token_ids_safe,
             -float("inf"),
             mask=mask,
         )

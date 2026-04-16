@@ -174,8 +174,10 @@ def _prepare_prefill_inputs_kernel(
     for i in range(0, query_len, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
         mask = block < query_len
-        tokens = tl.load(request_ptr + num_computed + block, mask=mask)
-        tl.store(input_ids_ptr + query_start + block, tokens, mask=mask)
+        # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+        block_safe = tl.where(mask, block, 0)
+        tokens = tl.load(request_ptr + num_computed + block_safe, mask=mask)
+        tl.store(input_ids_ptr + query_start + block_safe, tokens, mask=mask)
 
     next_pos = num_computed + query_len
     if next_pos < prefill_len:
@@ -223,7 +225,9 @@ def _prepare_pos_seq_lens_kernel(
         for i in tl.range(num_reqs, max_num_reqs, BLOCK_SIZE):
             block = i + tl.arange(0, BLOCK_SIZE)
             mask = block < max_num_reqs
-            tl.store(seq_lens_ptr + block, 0, mask=mask)
+            # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+            block_safe = tl.where(mask, block, 0)
+            tl.store(seq_lens_ptr + block_safe, 0, mask=mask)
         return
 
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
@@ -239,8 +243,10 @@ def _prepare_pos_seq_lens_kernel(
     for i in tl.range(0, query_len, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
         mask = block < query_len
+        # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+        block_safe = tl.where(mask, block, 0)
         pos = num_computed_tokens + block
-        tl.store(pos_ptr + start + block, pos, mask=mask)
+        tl.store(pos_ptr + start + block_safe, pos, mask=mask)
 
 
 def prepare_pos_seq_lens(
@@ -291,10 +297,13 @@ def _combine_sampled_and_draft_tokens_kernel(
     block = tl.arange(0, BLOCK_SIZE)
     query_end = tl.load(query_start_loc_ptr + batch_idx + 1)
     logits_start = query_end - num_logits
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    logits_mask = block < num_logits
+    block_safe_logits = tl.where(logits_mask, block, 0)
     tl.store(
-        logits_indices_ptr + cu_num_logits_start + block,
+        logits_indices_ptr + cu_num_logits_start + block_safe_logits,
         logits_start + block,
-        mask=block < num_logits,
+        mask=logits_mask,
     )
 
     seq_len = tl.load(seq_lens_ptr + batch_idx)
@@ -310,12 +319,13 @@ def _combine_sampled_and_draft_tokens_kernel(
     # Write the draft tokens (if any) to input_ids.
     if num_draft_tokens > 0:
         mask = block < num_draft_tokens
+        block_safe = tl.where(mask, block, 0)
         draft_tokens = tl.load(
-            draft_tokens_ptr + req_state_idx * draft_tokens_stride + block,
+            draft_tokens_ptr + req_state_idx * draft_tokens_stride + block_safe,
             mask=mask,
         )
         tl.store(
-            input_ids_ptr + query_end - num_draft_tokens + block,
+            input_ids_ptr + query_end - num_draft_tokens + block_safe,
             draft_tokens,
             mask=mask,
         )
@@ -550,9 +560,11 @@ def _expand_idx_mapping_kernel(
 
     block = tl.arange(0, BLOCK_SIZE)
     mask = block < num_tokens
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    block_safe = tl.where(mask, block, 0)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx)
-    tl.store(expanded_idx_mapping_ptr + start_idx + block, req_state_idx, mask=mask)
-    tl.store(expanded_local_pos_ptr + start_idx + block, block, mask=mask)
+    tl.store(expanded_idx_mapping_ptr + start_idx + block_safe, req_state_idx, mask=mask)
+    tl.store(expanded_local_pos_ptr + start_idx + block_safe, block, mask=mask)
 
 
 def expand_idx_mapping(

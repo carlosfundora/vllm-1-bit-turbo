@@ -97,10 +97,13 @@ def _fwd_kernel_stage1(
     offs_dv = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lk
     mask_dv = offs_dv < Lv
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    offs_d_safe = tl.where(mask_d, offs_d, 0)
+    offs_dv_safe = tl.where(mask_dv, offs_dv, 0)
     cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
     cur_batch_req_idx = cur_batch
 
-    off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
+    off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d_safe
     q = tl.load(Q + off_q, mask=mask_d, other=0.0)
 
     kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
@@ -116,18 +119,20 @@ def _fwd_kernel_stage1(
         vs = tl.load(v_scale)
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
+            # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+            offs_n_safe = tl.where(offs_n < split_kv_end, offs_n, 0)
             kv_page_number = tl.load(
                 Req_to_tokens
                 + stride_req_to_tokens_b * cur_batch_req_idx
-                + offs_n // PAGE_SIZE,
+                + offs_n_safe // PAGE_SIZE,
                 mask=offs_n < split_kv_end,
                 other=0,
             )
-            kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
+            kv_loc = kv_page_number * PAGE_SIZE + offs_n_safe % PAGE_SIZE
             offs_buf_k = (
                 kv_loc[:, None] * stride_buf_kbs
                 + cur_kv_head * stride_buf_kh
-                + offs_d[None, :]
+                + offs_d_safe[None, :]
             )
             k = tl.load(
                 K_Buffer + offs_buf_k,
@@ -147,7 +152,7 @@ def _fwd_kernel_stage1(
             offs_buf_v = (
                 kv_loc[:, None] * stride_buf_vbs
                 + cur_kv_head * stride_buf_vh
-                + offs_dv[None, :]
+                + offs_dv_safe[None, :]
             )
             v = tl.load(
                 V_Buffer + offs_buf_v,
@@ -170,7 +175,7 @@ def _fwd_kernel_stage1(
             cur_batch * stride_mid_ob
             + cur_head * stride_mid_oh
             + split_kv_id * stride_mid_os
-            + offs_dv
+            + offs_dv_safe
         )
 
         tl.store(
@@ -307,10 +312,14 @@ def _fwd_grouped_kernel_stage1(
     offs_dv = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lk
     mask_dv = offs_dv < Lv
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    offs_d_safe = tl.where(mask_d, offs_d, 0)
+    offs_dv_safe = tl.where(mask_dv, offs_dv, 0)
+    cur_head_safe = tl.where(mask_h, cur_head, 0)
     cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
     cur_batch_req_idx = cur_batch
 
-    offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
+    offs_q = cur_batch * stride_qbs + cur_head_safe[:, None] * stride_qh + offs_d_safe[None, :]
     q = tl.load(
         Q + offs_q,
         mask=(mask_h[:, None]) & (mask_d[None, :]),
@@ -321,8 +330,10 @@ def _fwd_grouped_kernel_stage1(
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
         mask_dpe = offs_dpe < Lk
+        # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+        offs_dpe_safe = tl.where(mask_dpe, offs_dpe, 0)
         off_qpe = (
-            cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
+            cur_batch * stride_qbs + cur_head_safe[:, None] * stride_qh + offs_dpe_safe[None, :]
         )
         qpe = tl.load(
             Q + off_qpe,
@@ -340,24 +351,26 @@ def _fwd_grouped_kernel_stage1(
     acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
 
     if split_kv_end > split_kv_start:
-        base_offs_k = cur_kv_head * stride_buf_kh + offs_d[:, None]
-        base_offs_v = cur_kv_head * stride_buf_vh + offs_dv[None, :]
+        base_offs_k = cur_kv_head * stride_buf_kh + offs_d_safe[:, None]
+        base_offs_v = cur_kv_head * stride_buf_vh + offs_dv_safe[None, :]
         if BLOCK_DPE > 0:
-            base_offs_kpe = cur_kv_head * stride_buf_kh + offs_dpe[:, None]
+            base_offs_kpe = cur_kv_head * stride_buf_kh + offs_dpe_safe[:, None]
 
         ks = tl.load(k_scale)
         vs = tl.load(v_scale)
         for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
+            # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+            offs_n_safe = tl.where(offs_n < split_kv_end, offs_n, 0)
             kv_page_number = tl.load(
                 Req_to_tokens
                 + stride_req_to_tokens_b * cur_batch_req_idx
-                + offs_n // PAGE_SIZE,
+                + offs_n_safe // PAGE_SIZE,
                 mask=offs_n < split_kv_end,
                 other=0,
                 cache_modifier=".ca",
             )
-            kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
+            kv_loc = kv_page_number * PAGE_SIZE + offs_n_safe % PAGE_SIZE
 
             # explicitly facilitate overlapping load/compute
             offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
@@ -417,9 +430,9 @@ def _fwd_grouped_kernel_stage1(
 
         offs_mid_o = (
             cur_batch * stride_mid_ob
-            + cur_head[:, None] * stride_mid_oh
+            + cur_head_safe[:, None] * stride_mid_oh
             + split_kv_id * stride_mid_os
-            + offs_dv[None, :]
+            + offs_dv_safe[None, :]
         )
 
         tl.store(
@@ -430,7 +443,7 @@ def _fwd_grouped_kernel_stage1(
 
         offs_mid_o_1 = (
             cur_batch * stride_mid_ob
-            + cur_head * stride_mid_oh
+            + cur_head_safe * stride_mid_oh
             + split_kv_id * stride_mid_os
             + Lv
         )
@@ -559,12 +572,14 @@ def _fwd_kernel_stage2(
 
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lv
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    offs_d_safe = tl.where(mask_d, offs_d, 0)
 
     e_sum = 0.0
     e_max = -float("inf")
     acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
 
-    offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
+    offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d_safe
     offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + Lv
 
     for split_kv_id in range(0, NUM_KV_SPLITS):
@@ -588,7 +603,7 @@ def _fwd_kernel_stage2(
             e_max = n_e_max
 
     tl.store(
-        o + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
+        o + cur_batch * stride_obs + cur_head * stride_oh + offs_d_safe,
         acc / e_sum,
         mask=mask_d,
     )

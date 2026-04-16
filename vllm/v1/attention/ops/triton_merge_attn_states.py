@@ -82,6 +82,8 @@ def merge_attn_states_kernel(
 
     head_arange = tl.arange(0, PADDED_HEAD_SIZE)
     head_mask = head_arange < HEAD_SIZE
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    head_arange_safe = tl.where(head_mask, head_arange, 0)
 
     # For tokens without context (token_idx >= prefill_tokens_with_context),
     # directly copy from suffix_output
@@ -94,7 +96,7 @@ def merge_attn_states_kernel(
             suffix_output
             + token_idx * num_heads * prefix_head_stride
             + head_idx * prefix_head_stride
-            + head_arange,
+            + head_arange_safe,
             mask=head_mask,
         )
 
@@ -107,7 +109,7 @@ def merge_attn_states_kernel(
             output
             + token_idx * num_heads * output_head_stride
             + head_idx * output_head_stride
-            + head_arange,
+            + head_arange_safe,
             s_out,
             mask=head_mask,
         )
@@ -142,14 +144,14 @@ def merge_attn_states_kernel(
         prefix_output
         + token_idx * num_heads * prefix_head_stride
         + head_idx * prefix_head_stride
-        + head_arange,
+        + head_arange_safe,
         mask=head_mask,
     )
     s_out = tl.load(
         suffix_output
         + token_idx * num_heads * prefix_head_stride
         + head_idx * prefix_head_stride
-        + head_arange,
+        + head_arange_safe,
         mask=head_mask,
     )
 
@@ -169,7 +171,7 @@ def merge_attn_states_kernel(
         output
         + token_idx * num_heads * output_head_stride
         + head_idx * output_head_stride
-        + head_arange,
+        + head_arange_safe,
         out,
         mask=head_mask,
     )

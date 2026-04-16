@@ -200,6 +200,8 @@ def kernel_unified_attention_2d(
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     offs_t = tl.arange(0, TILE_SIZE)
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    offs_d_safe = tl.where(offs_d < HEAD_SIZE, offs_d, 0)
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
@@ -207,7 +209,7 @@ def kernel_unified_attention_2d(
     query_offset = (
         query_offset_0[:, None] * query_stride_0
         + query_offset_1[:, None] * query_stride_1
-        + offs_d[None, :]
+        + offs_d_safe[None, :]
     )
 
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
@@ -303,23 +305,25 @@ def kernel_unified_attention_2d(
     for j in range(tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
+        # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+        seq_offset_safe = tl.where(tile_mask, seq_offset, 0)
 
         physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            block_tables_ptr + block_table_offset + seq_offset_safe // BLOCK_SIZE
         ).to(tl.int64)
 
         v_offset = (
             physical_block_idx[:, None] * stride_v_cache_0
             + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            + offs_d_safe[None, :] * stride_v_cache_3
+            + (seq_offset_safe % BLOCK_SIZE)[:, None] * stride_v_cache_1
         )
 
         k_offset = (
             physical_block_idx[None, :] * stride_k_cache_0
             + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            + offs_d_safe[:, None] * stride_k_cache_3
+            + (seq_offset_safe % BLOCK_SIZE)[None, :] * stride_k_cache_1
         )
 
         # K : (HEAD_SIZE, TILE_SIZE)
@@ -487,7 +491,7 @@ def kernel_unified_attention_2d(
     output_offset = (
         query_offset_0[:, None] * output_stride_0
         + query_offset_1[:, None] * output_stride_1
-        + offs_d[None, :]
+        + offs_d_safe[None, :]
     )
 
     tl.store(
@@ -593,6 +597,8 @@ def kernel_unified_attention_3d(
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     offs_t = tl.arange(0, TILE_SIZE)
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    offs_d_safe = tl.where(offs_d < HEAD_SIZE, offs_d, 0)
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
@@ -600,7 +606,7 @@ def kernel_unified_attention_3d(
     query_offset = (
         query_offset_0[:, None] * query_stride_0
         + query_offset_1[:, None] * query_stride_1
-        + offs_d[None, :]
+        + offs_d_safe[None, :]
     )
 
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
@@ -694,23 +700,25 @@ def kernel_unified_attention_3d(
     ):
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
+        # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+        seq_offset_safe = tl.where(tile_mask, seq_offset, 0)
 
         physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            block_tables_ptr + block_table_offset + seq_offset_safe // BLOCK_SIZE
         ).to(tl.int64)
 
         v_offset = (
             physical_block_idx[:, None] * stride_v_cache_0
             + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            + offs_d_safe[None, :] * stride_v_cache_3
+            + (seq_offset_safe % BLOCK_SIZE)[:, None] * stride_v_cache_1
         )
 
         k_offset = (
             physical_block_idx[None, :] * stride_k_cache_0
             + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            + offs_d_safe[:, None] * stride_k_cache_3
+            + (seq_offset_safe % BLOCK_SIZE)[None, :] * stride_k_cache_1
         )
 
         # K : (HEAD_SIZE, TILE_SIZE)
@@ -869,12 +877,15 @@ def kernel_unified_attention_3d(
         else:
             acc += tl.dot(P.to(V.dtype), V)
 
+    # RDNA2 safety: clamp dim arange for output stores
+    offs_d_out = tl.arange(0, HEAD_SIZE_PADDED)
+    offs_d_out_safe = tl.where(offs_d_out < HEAD_SIZE, offs_d_out, 0)
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)
         * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
         + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
         + segm_idx * HEAD_SIZE_PADDED
-        + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
+        + offs_d_out_safe[None, :]
     )
     tl.store(
         segm_output_ptr + segm_output_offset,
@@ -934,12 +945,17 @@ def reduce_segments(
         [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
     )
     dim_mask = tl.where(tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE, 1, 0).to(tl.int1)
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    offs_d_reduce = tl.arange(0, HEAD_SIZE_PADDED)
+    offs_d_reduce_safe = tl.where(offs_d_reduce < HEAD_SIZE, offs_d_reduce, 0)
+    offs_segm = tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+    offs_segm_safe = tl.where(segm_mask, offs_segm, 0)
 
     # load segment maxima
     segm_offset = (
         query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
         + query_head_idx * NUM_SEGMENTS_PER_SEQ
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+        + offs_segm_safe
     )
     segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
     overall_max = tl.max(segm_max)
@@ -954,8 +970,8 @@ def reduce_segments(
         query_token_idx.to(tl.int64)
         * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
         + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED
-        + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
+        + offs_segm_safe[:, None] * HEAD_SIZE_PADDED
+        + offs_d_reduce_safe[None, :]
     )
     segm_output = tl.load(
         segm_output_ptr + segm_output_offset,
@@ -975,7 +991,7 @@ def reduce_segments(
     output_offset = (
         query_token_idx * output_stride_0
         + query_head_idx * output_stride_1
-        + tl.arange(0, HEAD_SIZE_PADDED)
+        + offs_d_reduce_safe
     )
     tl.store(output_ptr + output_offset, acc, mask=dim_mask)
 

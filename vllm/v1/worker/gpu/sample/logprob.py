@@ -24,29 +24,34 @@ def _topk_log_softmax_kernel(
     max_val = float("-inf")
     for i in range(0, vocab_size, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
-        logits = tl.load(row_ptr + block, mask=block < vocab_size, other=float("-inf"))
+        block_mask = block < vocab_size
+        block_safe = tl.where(block_mask, block, 0)  # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+        logits = tl.load(row_ptr + block_safe, mask=block_mask, other=float("-inf"))
         max_val = tl.max(tl.maximum(logits, max_val))
     max_val = max_val.to(tl.float32)  # type: ignore
 
     se = 0.0
     for i in range(0, vocab_size, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
-        logits = tl.load(row_ptr + block, mask=block < vocab_size, other=0.0)
+        block_mask = block < vocab_size
+        block_safe = tl.where(block_mask, block, 0)
+        logits = tl.load(row_ptr + block_safe, mask=block_mask, other=0.0)
         # NOTE(woosuk): Make sure that logits and all following operations use FP32.
         logits = logits.to(tl.float32)
         e = tl.exp(logits - max_val)
-        e = tl.where(block < vocab_size, e, 0.0)
+        e = tl.where(block_mask, e, 0.0)
         se += tl.sum(e)
     lse = tl.log(se)
 
     k_offset = tl.arange(0, PADDED_TOPK)
     k_mask = k_offset < topk
-    topk_ids = tl.load(topk_ids_ptr + req_idx * topk + k_offset, mask=k_mask, other=0)
+    k_offset_safe = tl.where(k_mask, k_offset, 0)
+    topk_ids = tl.load(topk_ids_ptr + req_idx * topk + k_offset_safe, mask=k_mask, other=0)
 
     logits = tl.load(row_ptr + topk_ids, mask=k_mask)
     logits = logits.to(tl.float32)
     o = logits - max_val - lse
-    tl.store(output_ptr + req_idx * topk + k_offset, o, mask=k_mask)
+    tl.store(output_ptr + req_idx * topk + k_offset_safe, o, mask=k_mask)
 
 
 @triton.jit
@@ -67,7 +72,9 @@ def _ranks_kernel(
     n = 0
     for i in range(0, vocab_size, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
-        logits = tl.load(row_ptr + block, mask=block < vocab_size, other=float("-inf"))
+        block_mask = block < vocab_size
+        block_safe = tl.where(block_mask, block, 0)  # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+        logits = tl.load(row_ptr + block_safe, mask=block_mask, other=float("-inf"))
         n += tl.sum((logits >= x).to(tl.int32))
     tl.store(output_ptr + req_idx, n)
 

@@ -164,10 +164,13 @@ def fp8_mm_k(
             # Partial block at the tail: mask out-of-bounds elements
             k_offsets = tl.arange(0, BLOCK_K)
             mask = iter_k + k_offsets < K
-            tiled_b = tl.load(b_ptr, mask=mask[:, None], other=0.0)
+            # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+            k_offsets_safe = tl.where(mask, k_offsets, 0)
+            k_correction = k_offsets_safe - k_offsets
+            tiled_b = tl.load(b_ptr + k_correction[:, None] * bk_stride, mask=mask[:, None], other=0.0)
             if USE_GDC:
                 tl.extra.cuda.gdc_wait()
-            tiled_a = tl.load(a_ptr, mask=mask[None, :], other=0.0)
+            tiled_a = tl.load(a_ptr + k_correction[None, :] * ak_stride, mask=mask[None, :], other=0.0)
             if CAST_TYPE:
                 tiled_a = tiled_a.to(b_dtype)
 
@@ -366,11 +369,16 @@ def do_shrink_kernel_fp8(
     # Identify the C output pointers to store the results of the accumulator.
     offset_cn = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
     offset_cm = tl.arange(0, BLOCK_M)
+    cn_mask = offset_cn < N
+    cm_mask = offset_cm < M_LEN
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    offset_cn_safe = tl.where(cn_mask, offset_cn, 0)
+    offset_cm_safe = tl.where(cm_mask, offset_cm, 0)
     cur_out_ptr = out_ptr if SLICE_NUM == 1 else out_ptr + slice_id * output_d0_stride
     c_ptr = (
         cur_out_ptr
         + ram[:, None] * output_d1_stride
-        + offset_cn[None, :] * output_d2_stride
+        + offset_cn_safe[None, :] * output_d2_stride
     )
     c_mask = (offset_cm[:, None] < M_LEN) & (offset_cn[None, :] < N)
 
@@ -590,10 +598,15 @@ def do_expand_kernel_fp8(
     # Identify the C output pointers to store the results of the accumulator.
     offset_cn = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N + cur_slice_start
     offset_cm = tl.arange(0, BLOCK_M)
+    cn_mask = offset_cn < (cur_slice_start + N)
+    cm_mask = offset_cm < M_LEN
+    # RDNA2 safety: clamp OOB offsets so inactive lanes don't fault
+    offset_cn_safe = tl.where(cn_mask, offset_cn, 0)
+    offset_cm_safe = tl.where(cm_mask, offset_cm, 0)
     c_ptr = (
         out_ptr
         + ram[:, None] * output_d0_stride
-        + offset_cn[None, :] * output_d1_stride
+        + offset_cn_safe[None, :] * output_d1_stride
     )
     c_mask = (offset_cm[:, None] < M_LEN) & (offset_cn[None, :] < (cur_slice_start + N))
 

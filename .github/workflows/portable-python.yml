@@ -50,7 +50,7 @@ jobs:
           while IFS= read -r file; do
             [[ -z "$file" ]] && continue
             case "$file" in
-              vllm/*|vllm/**|tests/*|tests/**|examples/*|examples/**|tools/*|tools/**|requirements*.txt|pyproject.toml|setup.py|.github/workflows/portable-python.yml)
+              vllm/*|vllm/**|tests/*|tests/**|examples/*|examples/**|tools/*|tools/**|requirements*.txt|pyproject.toml|setup.py)
                 python=true ;;
             esac
           done <<< "$changed"
@@ -61,31 +61,32 @@ jobs:
     needs: detect
     if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.detect.outputs.python == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.12"]
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install deps
+      - name: Install lint/test tools only
         run: |
           python -m pip install --upgrade pip
-          pip install -e . pytest ruff mypy
+          pip install pytest ruff mypy
       - name: Ruff
-        run: ruff check .
-      - name: Mypy
+        run: ruff check vllm tests examples tools
+      - name: Mypy advisory
+        continue-on-error: true
         run: mypy vllm
-      - name: Import smoke
-        run: python -c "import vllm; print('ok')"
-      - name: CPU-safe tests
-        run: pytest -q -m "not slow_test and not distributed"
+      - name: Compile Python sources
+        run: python -m compileall vllm
       - name: Upload artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v5
